@@ -1,5 +1,6 @@
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
+import os
 import json
 import hashlib
 import boto3
@@ -11,8 +12,8 @@ try:
     ec2_region = os.environ['EC2_REGION']
     configmap_name = os.environ['CONFIGMAP_NAME']
     security_group_name = os.environ['SECURITY_GROUP_NAME']
-except as e:
-    print(e)
+except Exception as e:
+    print("miss env: %s\n" % e)
     os._exit(1)
 
 ingress_ports = [ 80 ]
@@ -26,7 +27,6 @@ def get_kube_nodes_ip(kube_client):
         for item in nodes.items:
             for addresses in item.status.addresses:
                 if addresses.type == 'ExternalIP':
-                    print addresses.address
                     data.append(addresses.address + '/32')
         ip_list = sorted(data)
         ip_list_str = '\n'.join(ip_list)
@@ -103,7 +103,7 @@ def update_security_groups(ip_list):
         )
     
     groups = get_security_groups_for_update(client)
-    print ('Found ' + str(len(groups)) + ' SecurityGroups to update')
+    print("Found %s SecurityGroups to update" % str(len(groups)))
  
     result = []
     updated = 0
@@ -149,12 +149,12 @@ def update_security_group(client, group, ip_list):
                     old_prefixes.append(cidr)
                     if ip_list.count(cidr) == 0:
                         to_revoke.append(range)
-                        print(group['GroupId'] + ": Revoking " + cidr + ":" + str(permission['ToPort']))
+                        print("%s : Revoking %s : %s" % (group['GroupId'], cidr, str(permission['ToPort'])))
             
                 for range in ip_list:
                     if old_prefixes.count(range) == 0:
                         to_add.append({ 'CidrIp': range })
-                        print(group['GroupId'] + ": Adding " + range + ":" + str(permission['ToPort']))
+                        print("%s : Adding %s : %s" % (group['GroupId'], range, str(permission['ToPort'])))
             
                 removed += revoke_permissions(client, group, permission, to_revoke)
                 added += add_permissions(client, group, permission, to_add)
@@ -163,11 +163,11 @@ def update_security_group(client, group, ip_list):
             to_add = list()
             for range in new_ranges:
                 to_add.append({ 'CidrIp': range })
-                print(group['GroupId'] + ": Adding " + range + ":" + str(port))
+                print("%s : Adding %s : %s" % (group['GroupId'], range, str(port)))
             permission = { 'ToPort': port, 'FromPort': port, 'IpProtocol': 'tcp'}
             added += add_permissions(client, group, permission, to_add)
  
-    print (group['GroupId'] + ": Added " + str(added) + ", Revoked " + str(removed))
+    print("%s : Added %s, Revoked %s" % (group['GroupId'], str(added), str(removed)))
     return (added > 0 or removed > 0)
 
 def add_permissions(client, group, permission, to_add):
@@ -204,7 +204,7 @@ def main():
     ip_list, ip_list_str, ip_list_hash = get_kube_nodes_ip(kube_client)
     if not ip_list:
         print("cannot get kube nodes ip")
-        return
+        os._exit(1)
 
     # get the current value of the ConfigMap
     current_value = get_current_configmap_value(kube_client)
