@@ -1,0 +1,3 @@
+ubernetes==9.0.0
+boto3==1.9.167
+botocore==1.12.167

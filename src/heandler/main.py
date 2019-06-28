@@ -5,6 +5,7 @@ import json
 import hashlib
 import boto3
 import botocore
+import logging
 
 try:
     aws_access_key_id = os.environ['AWS_ACCESS_KEY_ID']
@@ -23,7 +24,7 @@ namespace = open("/var/run/secrets/kubernetes.io/serviceaccount/namespace").read
 def get_kube_nodes_ip(kube_client):
     data, ip_list = [], []
     try:                 
-        nodes = kube_client.list_node(limit=10)
+        nodes = kube_client.list_node(limit=500)
         for item in nodes.items:
             for addresses in item.status.addresses:
                 if addresses.type == 'ExternalIP':
@@ -36,26 +37,30 @@ def get_kube_nodes_ip(kube_client):
         m.update(ip_list_str)
         ip_list_hash = m.hexdigest()
 
+        logging.info("current kube nodes ip list:\n %s" % ip_list_str)
         return ip_list, ip_list_str, ip_list_hash
 
     except ApiException as e:
-        print("Exception when calling CoreV1Api->read_node: %s\n" % e)
+        logging.error("Exception when calling CoreV1Api->read_node: %s\n" % e)
 
 def get_current_configmap_value(kube_client):
-    configmap_value, current_value = None, None
+    configmap_value, previous_ip_list_hash = None, None
+    previous_sg_update_state = 'failed'
     try:
         configmap_value = kube_client.read_namespaced_config_map(configmap_name, namespace)
-        print("current configmap value: %s " % configmap_value)
+        logging.info("current configmap value: %s " % configmap_value)
     except ApiException as e:
-        print("Exception when calling CoreV1Api->read_namespaced_config_map: %s\n" % e)
+        logging.error("Exception when calling CoreV1Api->read_namespaced_config_map: %s\n" % e)
 
     if configmap_value:
         if configmap_value.data and 'checksum' in configmap_value.data:
-            current_value = configmap_value.data['checksum']
+            previous_ip_list_hash = configmap_value.data['checksum']
+        if configmap_value.data and 'sg_update_state' in configmap_value.data:
+            previous_sg_update_state = configmap_value.data['sg_update_state']
 
-    return current_value
+    return previous_ip_list_hash, previous_sg_update_state
 
-def create_configmap_object(ip_list_str,ip_list_hash):
+def create_configmap_object(ip_list_str,ip_list_hash,sg_update_state):
     # Configureate ConfigMap metadata
     metadata = client.V1ObjectMeta(
         name = configmap_name,
@@ -65,7 +70,7 @@ def create_configmap_object(ip_list_str,ip_list_hash):
     configmap = client.V1ConfigMap(
         api_version="v1",
         kind="ConfigMap",
-        data=dict(ips=ip_list_str,checksum=ip_list_hash),
+        data=dict(ips=ip_list_str,checksum=ip_list_hash,sg_update_state=sg_update_state),
         metadata=metadata
     )
     return configmap
@@ -77,9 +82,9 @@ def create_configmap(kube_client, configmap):
             body = configmap,
             pretty = 'pretty_example'
         )
-        print(api_response)
+        logging.info(api_response)
     except ApiException as e:
-        print("Exception when calling CoreV1Api->create_namespaced_config_map: %s\n" % e)
+        logging.error("Exception when calling CoreV1Api->create_namespaced_config_map: %s\n" % e)
 
 def replace_configmap(kube_client, configmap):
     try:
@@ -89,10 +94,10 @@ def replace_configmap(kube_client, configmap):
             body = configmap,
             pretty = 'pretty_example'
         )
-        print(api_response)
+        logging.info(api_response)
 
     except ApiException as e:
-        print("Exception when calling CoreV1Api->replace_namespaced_config_map: %s\n" % e)
+        logging.error("Exception when calling CoreV1Api->replace_namespaced_config_map: %s\n" % e)
 
 def update_security_groups(ip_list):
     client = boto3.client(
@@ -101,21 +106,25 @@ def update_security_groups(ip_list):
         aws_secret_access_key=aws_secret_access_key,
         region_name=ec2_region
         )
-    
-    groups = get_security_groups_for_update(client)
-    print("Found %s SecurityGroups to update" % str(len(groups)))
- 
-    result = []
-    updated = 0
-    
-    for group in groups:
-        if update_security_group(client, group, ip_list):
-            updated += 1
-            result.append('Updated ' + group['GroupId'])
-    
-    result.append('Updated ' + str(updated) + ' of ' + str(len(groups)) + ' SecurityGroups')
 
-    return result
+    try:
+        groups = get_security_groups_for_update(client)
+        logging.info("Found %s SecurityGroups to update" % str(len(groups)))
+     
+        result = []
+        updated = 0
+        
+        for group in groups:
+            if update_security_group(client, group, ip_list):
+                updated += 1
+                result.append('Updated ' + group['GroupId'])
+        
+        result.append('Updated ' + str(updated) + ' of ' + str(len(groups)) + ' SecurityGroups')
+
+        return 'succeeded'
+    except Exception as e:
+        logging.error(e)
+        return 'failed'
 
 def get_security_groups_for_update(client):
     filters = list();
@@ -149,12 +158,12 @@ def update_security_group(client, group, ip_list):
                     old_prefixes.append(cidr)
                     if ip_list.count(cidr) == 0:
                         to_revoke.append(range)
-                        print("%s : Revoking %s : %s" % (group['GroupId'], cidr, str(permission['ToPort'])))
+                        logging.info("%s : Revoking %s : %s" % (group['GroupId'], cidr, str(permission['ToPort'])))
             
                 for range in ip_list:
                     if old_prefixes.count(range) == 0:
                         to_add.append({ 'CidrIp': range })
-                        print("%s : Adding %s : %s" % (group['GroupId'], range, str(permission['ToPort'])))
+                        logging.info("%s : Adding %s : %s" % (group['GroupId'], range, str(permission['ToPort'])))
             
                 removed += revoke_permissions(client, group, permission, to_revoke)
                 added += add_permissions(client, group, permission, to_add)
@@ -163,11 +172,11 @@ def update_security_group(client, group, ip_list):
             to_add = list()
             for range in new_ranges:
                 to_add.append({ 'CidrIp': range })
-                print("%s : Adding %s : %s" % (group['GroupId'], range, str(port)))
+                logging.info("%s : Adding %s : %s" % (group['GroupId'], range, str(port)))
             permission = { 'ToPort': port, 'FromPort': port, 'IpProtocol': 'tcp'}
             added += add_permissions(client, group, permission, to_add)
  
-    print("%s : Added %s, Revoked %s" % (group['GroupId'], str(added), str(removed)))
+    logging.info("%s : Added %s, Revoked %s" % (group['GroupId'], str(added), str(removed)))
     return (added > 0 or removed > 0)
 
 def add_permissions(client, group, permission, to_add):
@@ -197,33 +206,49 @@ def revoke_permissions(client, group, permission, to_revoke):
     return len(to_revoke)
 
 def main():
+    # setup logging
+    root = logging.getLogger()
+    if root.handlers:
+        for handler in root.handlers:
+            root.removeHandler(handler)
+    logging.basicConfig(format='[%(asctime)s] [%(levelname)s] %(message)s',level=logging.INFO)
+
     config.load_incluster_config()
     kube_client = client.CoreV1Api()
 
     # get kube node ip
     ip_list, ip_list_str, ip_list_hash = get_kube_nodes_ip(kube_client)
     if not ip_list:
-        print("cannot get kube nodes ip")
+        logging.error("cannot get kube nodes ip")
         os._exit(1)
 
     # get the current value of the ConfigMap
-    current_value = get_current_configmap_value(kube_client)
+    previous_ip_list_hash, previous_sg_update_state = get_current_configmap_value(kube_client)
 
-    if current_value is None:
-        # create a configmap
-        print("configmap not found, create it.")
-        configmap = create_configmap_object(ip_list_str, ip_list_hash)
+    # if ConfigMap not found.
+    if previous_ip_list_hash is None:
+
+        logging.info("update security group")
+        sg_update_state = update_security_groups(ip_list)
+
+        # create a ConfigMap
+        logging.info("configmap not found, create it.")
+        configmap = create_configmap_object(ip_list_str, ip_list_hash, sg_update_state)
         create_configmap(kube_client, configmap)
-        update_security_groups(ip_list)
 
-    elif current_value != ip_list_hash:
-        # kube nodes ip was change, replace the configmap
-        print("update configmap")
-        configmap = create_configmap_object(ip_list_str, ip_list_hash)
+    # if kube nodes ip was change, or sg update failed
+    elif previous_ip_list_hash != ip_list_hash or previous_sg_update_state != 'succeeded':
+        #update security group
+        logging.info("update security group")
+        sg_update_state = update_security_groups(ip_list)
+
+        # update ConfigMap
+        logging.info("update configmap")
+        configmap = create_configmap_object(ip_list_str, ip_list_hash, sg_update_state)
         replace_configmap(kube_client, configmap)
-        update_security_groups(ip_list)
+
     else:
-        print("success")
+        logging.info("kube nodes IP address hasn't changed, nothing to do")
 
 if __name__ == '__main__':
     main()
